@@ -11,7 +11,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from demo.corpus import make_corpus
 from graphroute import build_index
-from graphroute.graph import frontier_ppr, label_propagation, prune_topk
+from graphroute.graph import (
+    cooccurrence,
+    frontier_ppr,
+    label_propagation,
+    prune_topk,
+)
 from graphroute.index import GraphIndex, IndexConfig
 from graphroute.ingest import Document, extract_links
 from graphroute.router import RouteConfig, Router, bm25_scores, full_scan_baseline
@@ -118,6 +123,143 @@ def test_index_roundtrip(small_index, tmp_path):
     assert loaded.terms == small_index.terms
     assert (loaded.doc_topic == small_index.doc_topic).all()
     assert (loaded.adj != small_index.adj).nnz == 0
+    assert loaded.doc_topics.shape == small_index.doc_topics.shape
+    assert (loaded.doc_topics != small_index.doc_topics).nnz == 0
+    assert (loaded.doc_untopiced == small_index.doc_untopiced).all()
+
+
+# ------------------------------------------------------- link pseudo-terms
+
+
+def test_link_target_emits_its_own_pseudo_term():
+    """A -> B must put the *same* pseudo-term in both documents' postings.
+
+    Without the self-term, `link:b.md` occurs only in the documents citing
+    b.md, so b.md never shares it with its own citers and the graph can learn
+    co-citation but never citer -> citee.
+    """
+    docs = [
+        Document(path="/docs/a.md", text="alpha beta gamma delta",
+                 links=["/docs/b.md"]),
+        Document(path="/docs/b.md", text="epsilon zeta eta theta"),
+    ]
+    index = build_index(iter(docs), IndexConfig(min_anchors=1))
+    assert "link:b.md" in index.term_id
+    tid = index.term_id["link:b.md"]
+    holders = {index.paths[d] for d in index.postings[:, tid].tocoo().row}
+    assert holders == {"/docs/a.md", "/docs/b.md"}
+
+
+# ------------------------------------------------------ npmi support discount
+
+
+def _always_together(n_docs: int, joint: int) -> sp.csr_matrix:
+    """Two terms appearing in `joint` documents, always together, plus filler.
+
+    NPMI is exactly 1.0 for this shape regardless of `joint`, which is the
+    whole problem: support has to come from somewhere else.
+    """
+    rows, cols = [], []
+    for d in range(joint):
+        rows += [d, d]
+        cols += [0, 1]
+    for d in range(joint, n_docs):        # filler so df/n_docs stays fixed
+        rows.append(d)
+        cols.append(2)
+    return sp.csr_matrix(
+        (np.ones(len(rows), dtype=np.float32), (rows, cols)), shape=(n_docs, 3)
+    )
+
+
+def test_npmi_support_discount_is_monotone_in_joint_count():
+    # Identical probabilities in both corpora, hence identical raw NPMI (1.0):
+    # only the amount of support differs, and more support must never weigh
+    # less than less support.
+    raw_weak = cooccurrence(_always_together(100, 2), support_saturation=0)[0, 1]
+    raw_strong = cooccurrence(_always_together(400, 8), support_saturation=0)[0, 1]
+    assert raw_weak == pytest.approx(raw_strong, rel=1e-5) == pytest.approx(1.0)
+
+    weak = cooccurrence(_always_together(100, 2))[0, 1]
+    strong = cooccurrence(_always_together(400, 8))[0, 1]
+    assert strong >= weak
+    assert strong > weak, "the discount must actually separate them"
+    assert strong == pytest.approx(1.0, rel=1e-5)
+    assert weak == pytest.approx(np.log1p(2) / np.log1p(8), rel=1e-5)
+
+
+def test_npmi_support_discount_saturates_at_one():
+    """Well-supported pairs keep their full NPMI: the factor only ever cuts."""
+    w = cooccurrence(_always_together(2000, 500))[0, 1]
+    assert 0 < w <= 1.0 + 1e-6
+
+
+# ------------------------------------------------------- soft topic membership
+
+
+def test_soft_topics_admit_multi_topic_documents():
+    """A document straddling two topics must pass the gate for either one."""
+    from graphroute.index import _soft_doc_topics
+
+    mass = sp.csr_matrix(np.array([
+        [10.0, 9.0, 0.5],     # two real topics, one incidental
+        [10.0, 0.0, 0.0],     # single topic
+    ], dtype=np.float32))
+    membership = _soft_doc_topics(mass, max_topics=3, min_share=0.15)
+    assert set(membership[0].indices.tolist()) == {0, 1}   # 0.5 is below 15%
+    assert set(membership[1].indices.tolist()) == {0}
+
+
+def test_soft_topics_cap_at_max_doc_topics():
+    from graphroute.index import _soft_doc_topics
+
+    mass = sp.csr_matrix(np.array([[5.0, 4.0, 3.0, 2.0]], dtype=np.float32))
+    membership = _soft_doc_topics(mass, max_topics=3, min_share=0.0)
+    assert membership.nnz == 3
+    assert set(membership[0].indices.tolist()) == {0, 1, 2}
+
+
+def test_multi_topic_doc_passes_the_gate_for_both_of_its_topics():
+    """End to end: a document mixing two vocabularies is reachable from both.
+
+    The argmax projection made it a member of exactly one community, so half
+    the queries that should have found it were gated out before scoring.
+    """
+    docs = _mini_corpus()
+    blend = " ".join(
+        ["oauth token refresh bearer session"] * 12
+        + ["invoice ledger charge subscription proration"] * 12
+    )
+    docs.append(Document(path="/mixed/auth-billing.md", text=blend))
+    index = build_index(iter(docs))
+
+    doc_id = index.paths.index("/mixed/auth-billing.md")
+    assert index.doc_topics[doc_id].nnz >= 2, "should belong to both topics"
+
+    router = Router(index, RouteConfig(top_n=200))
+    for query in ("bearer token session refresh", "invoice ledger proration charge"):
+        res = router.route(query)
+        assert res.topics, "the gate must actually be active for this to mean anything"
+        gate = index.topic_gate_mask(res.topics)
+        assert gate[doc_id], (query, index.doc_topics[doc_id].indices, res.topics)
+
+
+def test_anchorless_documents_always_pass_the_gate():
+    """Docs with no anchors have no topics, and must not be gated out.
+
+    Parking them in topic 0 made them reachable only by queries that happened
+    to select topic 0 — a silent black hole in the corpus.
+    """
+    docs = _mini_corpus()
+    docs.append(Document(path="/odd/hapax.md", text="zzqq wibble frobnicate " * 3))
+    index = build_index(iter(docs))
+
+    doc_id = index.paths.index("/odd/hapax.md")
+    assert index.doc_untopiced[doc_id], "hapax-only doc should have no topics"
+    for topics in ([0], [1], [0, 2], list(range(index.n_topics))):
+        assert index.topic_gate_mask(topics)[doc_id]
+
+    res = Router(index, RouteConfig(top_n=50)).route("wibble frobnicate")
+    assert "/odd/hapax.md" in res.files
 
 
 def test_communities_align_with_ground_truth(small_index, small_corpus):
@@ -147,10 +289,70 @@ def test_route_returns_files_and_respects_top_n(small_index):
     assert all(f in small_index.paths for f in res.files)
 
 
+def test_top_n_override_does_not_mutate_the_shared_config(small_index):
+    """`route(top_n=5)` must not cap every later query on the same Router.
+
+    With no `**overrides`, `cfg` *was* `self.config`, so assigning `top_n` onto
+    it permanently rewrote the router's configuration.
+    """
+    router = Router(small_index, RouteConfig(top_n=25))
+    query = " ".join(small_index.terms[int(t)] for t in small_index.anchor_terms[:4])
+
+    baseline = router.route(query)
+    assert len(baseline.files) > 5, "need headroom for the assertion to bite"
+
+    narrowed = router.route(query, top_n=5)
+    assert len(narrowed.files) <= 5
+    assert router.config.top_n == 25
+
+    after = router.route(query)
+    assert len(after.files) == len(baseline.files)
+    assert after.files == baseline.files
+
+
+def test_overrides_do_not_leak_into_the_shared_config(small_index):
+    router = Router(small_index, RouteConfig(top_n=25, budget=4000))
+    router.route("anything at all", budget=10, top_n=2)
+    assert router.config.budget == 4000
+    assert router.config.top_n == 25
+
+
 def test_route_respects_budget(small_index, small_corpus):
     router = Router(small_index, RouteConfig(top_n=10, budget=50))
     for query, _ in small_corpus.queries[:10]:
         assert router.route(query).files_touched <= 50
+
+
+@pytest.mark.filterwarnings("ignore:no anchor terms")
+def test_budget_counts_only_fresh_documents():
+    """Re-scoring an already-touched doc is free and must not spend budget.
+
+    Every document here contains both query terms, so the second term's posting
+    list is entirely docs the first term already touched. Counting them again
+    declared the budget exhausted after touching 30 of 30 files.
+    """
+    docs = [
+        Document(path=f"/d{i:03d}.md", text="alpha beta gamma delta epsilon")
+        for i in range(30)
+    ]
+    index = build_index(iter(docs), IndexConfig(min_anchors=1, max_df_ratio=0.9))
+    res = Router(index, RouteConfig(top_n=50, budget=30)).route("alpha beta")
+    assert res.files_touched == 30
+    assert not res.budget_exhausted
+
+
+@pytest.mark.filterwarnings("ignore:no anchor terms")
+def test_budget_still_binds_on_genuinely_fresh_documents():
+    docs = [
+        Document(path=f"/d{i:03d}.md", text=f"alpha term{i} gamma")
+        for i in range(50)
+    ]
+    index = build_index(iter(docs), IndexConfig(min_anchors=1, max_df_ratio=0.9))
+    res = Router(index, RouteConfig(top_n=50, budget=20, df_ceiling_ratio=1.0)).route(
+        "alpha"
+    )
+    assert res.files_touched == 20
+    assert res.budget_exhausted
 
 
 def test_router_state_is_clean_between_queries(small_index, small_corpus):
@@ -371,14 +573,19 @@ def test_doc_filter_beats_post_hoc_filtering_under_budget(small_index):
     rng = np.random.default_rng(0)
     allowed = np.zeros(small_index.n_docs, dtype=bool)
     allowed[rng.choice(small_index.n_docs, size=60, replace=False)] = True
+    # A deliberately wide query spanning many topics, so the budget is the
+    # binding constraint rather than the size of the posting lists — that is
+    # the only regime in which the two strategies differ.
     query = " ".join(
-        small_index.terms[int(t)] for t in small_index.anchor_terms[:3]
+        small_index.terms[int(t)] for t in small_index.anchor_terms[::37][:12]
     )
 
-    router = Router(small_index, RouteConfig(top_n=50, budget=150))
+    router = Router(small_index, RouteConfig(top_n=50, budget=100))
     during = router.route(query, doc_filter=allowed)
-    post_hoc = [d for d in router.route(query).doc_ids if allowed[d]]
+    unfiltered = router.route(query)
+    post_hoc = [d for d in unfiltered.doc_ids if allowed[d]]
 
+    assert unfiltered.budget_exhausted, "test premise: the budget must bind"
     assert all(allowed[d] for d in during.doc_ids)
     assert len(during.doc_ids) > len(post_hoc)
 

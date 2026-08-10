@@ -19,13 +19,16 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 from . import graph as G
 from .index import GraphIndex
 from .text import query_terms
+
+SeedFn = Callable[[GraphIndex, List[int]], Dict[int, float]]
+"""`(index, literal_term_ids) -> {anchor_id: weight}`. Extra PPR seeds."""
 
 
 @dataclass
@@ -44,7 +47,10 @@ class RouteConfig:
     PPR distribution contributes rounding noise to the ranking, so cutting it
     is close to free in quality and most of the win in latency."""
     ppr_alpha: float = 0.45
-    ppr_hops: int = 3
+    ppr_hops: int = 2
+    """Hops of graph walk. Two, not three: the ablation in BENCHMARK.md shows
+    the third hop's terms sit below `min_term_weight` and are dropped anyway,
+    so the extra hop is latency the ranking never sees."""
     ppr_beam: int = 256
 
     # --- shard pruning ---
@@ -127,6 +133,25 @@ class RouteResult:
 
 
 class Router:
+    """Query-time router over a built :class:`GraphIndex`.
+
+    **A Router instance is not safe for concurrent queries.** The scratch
+    buffers (`_acc`, `_seen`, `_rejected`) are allocated once and reused across
+    calls — that is what keeps per-query allocation O(files touched) rather than
+    O(corpus) — so two threads calling `route()` on the same Router will read
+    and clear each other's partial scores. Use one Router per thread. The
+    underlying `GraphIndex` *is* read-only and safe to share, so the cheap
+    pattern is one index, one Router per worker::
+
+        index = GraphIndex.load("index.grx")
+        local = threading.local()
+
+        def route(q):
+            if not hasattr(local, "router"):
+                local.router = Router(index)
+            return local.router.route(q)
+    """
+
     def __init__(self, index: GraphIndex, config: Optional[RouteConfig] = None):
         self.index = index
         self.config = config or RouteConfig()
@@ -147,6 +172,7 @@ class Router:
         query: str,
         top_n: Optional[int] = None,
         doc_filter: Optional[np.ndarray] = None,
+        seed_fn: Optional[SeedFn] = None,
         **overrides,
     ) -> RouteResult:
         """Route `query` to candidate files.
@@ -159,9 +185,15 @@ class Router:
         inside the walk spends the budget entirely on files the caller can
         actually read. Build the mask once per role and reuse it; see
         `GraphIndex.mask_where`.
+
+        `seed_fn` optionally adds PPR seeds beyond the literal query terms —
+        see `_expand`. Off unless you pass one.
         """
+        # Copy before mutating: `cfg is self.config` when no overrides are
+        # given, so writing `top_n` onto it would permanently cap every
+        # subsequent query on this Router.
         cfg = self.config
-        if overrides:
+        if overrides or top_n is not None:
             cfg = RouteConfig(**{**cfg.__dict__, **overrides})
         if top_n is not None:
             cfg.top_n = top_n
@@ -185,8 +217,12 @@ class Router:
             result.latency_ms = (time.perf_counter() - t0) * 1000
             return result
 
-        weights = self._expand(literal_ids, cfg)
-        topics = self._select_topics(weights, cfg) if cfg.use_topic_gate else None
+        weights, ppr_nodes, ppr_scores = self._expand(literal_ids, cfg, seed_fn)
+        topics = (
+            self._select_topics(ppr_nodes, ppr_scores, cfg)
+            if cfg.use_topic_gate
+            else None
+        )
         result.topics = sorted(topics) if topics is not None else []
         result.expanded_terms = [
             (idx.terms[t], float(w))
@@ -229,8 +265,27 @@ class Router:
 
     # -------------------------------------------------------------- stages
 
-    def _expand(self, literal_ids: List[int], cfg: RouteConfig) -> Dict[int, float]:
-        """Literal query terms + graph neighbourhood, as term_id -> weight."""
+    def _expand(
+        self,
+        literal_ids: List[int],
+        cfg: RouteConfig,
+        seed_fn: Optional[SeedFn] = None,
+    ) -> Tuple[Dict[int, float], np.ndarray, np.ndarray]:
+        """Literal query terms + graph neighbourhood.
+
+        Returns `(weights, ppr_nodes, ppr_scores)`: the term_id -> weight map
+        that drives the postings walk, plus the raw PPR distribution over anchor
+        nodes that topic selection needs. The PPR arrays are returned rather
+        than stashed on `self` so the two stages have an explicit contract.
+
+        `seed_fn(index, literal_ids) -> {anchor_id: weight}` is the documented
+        insertion point for semantic seeding: a question whose words appear
+        nowhere in the corpus produces no literal seeds and therefore no walk,
+        and something that *does* know what the question means — an embedding
+        model, a synonym table, a query log — can supply anchors here. The
+        weights it returns are added to the literal ones and the rest of the
+        pipeline is unchanged.
+        """
         idx = self.index
         seeds: Dict[int, float] = {}
         for tid in literal_ids:
@@ -238,35 +293,39 @@ class Router:
             if aid >= 0:
                 seeds[aid] = seeds.get(aid, 0.0) + float(idx.idf[tid])
 
+        if seed_fn is not None:
+            for aid, w in (seed_fn(idx, literal_ids) or {}).items():
+                aid = int(aid)
+                if 0 <= aid < idx.adj.shape[0] and w > 0:
+                    seeds[aid] = seeds.get(aid, 0.0) + float(w)
+
         weights: Dict[int, float] = {}
+        nodes = np.empty(0, dtype=np.int64)
+        scores = np.empty(0, dtype=np.float32)
         if seeds:
             nodes, scores = G.frontier_ppr(
                 idx.adj, seeds,
                 alpha=cfg.ppr_alpha, hops=cfg.ppr_hops, beam=cfg.ppr_beam,
             )
             if nodes.size:
-                self._last_ppr = (nodes, scores)
                 term_ids = idx.anchor_terms[nodes]
                 peak = float(scores[0]) or 1.0
                 for tid, sc in zip(term_ids.tolist(), (scores / peak).tolist()):
                     weights[tid] = max(weights.get(tid, 0.0), sc)
-            else:
-                self._last_ppr = (np.empty(0, np.int64), np.empty(0, np.float32))
-        else:
-            self._last_ppr = (np.empty(0, np.int64), np.empty(0, np.float32))
 
         for tid in literal_ids:
             weights[tid] = weights.get(tid, 0.0) + cfg.literal_boost
-        return weights
+        return weights, nodes, scores
 
-    def _select_topics(self, weights: Dict[int, float], cfg: RouteConfig):
+    def _select_topics(
+        self, nodes: np.ndarray, scores: np.ndarray, cfg: RouteConfig
+    ):
         """Pick the smallest set of communities covering most of the mass.
 
         This is where millions become thousands. Everything after it is
         ordinary retrieval on a small candidate pool.
         """
         idx = self.index
-        nodes, scores = getattr(self, "_last_ppr", (None, None))
         if nodes is None or nodes.size == 0:
             return None
 
@@ -322,10 +381,10 @@ class Router:
         exempt = literal & selective
         ranked.sort(key=lambda kv: (kv[0] not in exempt,))
 
-        gate = None
-        if topics:
-            gate = np.zeros(idx.n_topics, dtype=bool)
-            gate[list(topics)] = True
+        # One vectorised pass turns the selected topic set into a per-document
+        # admission mask. Documents are multi-topic, so a doc passes if any of
+        # its topics was selected; documents with no topics always pass.
+        gate = idx.topic_gate_mask(topics) if topics else None
 
         touched_blocks: List[np.ndarray] = []
         rejected_blocks: List[np.ndarray] = []
@@ -360,7 +419,7 @@ class Router:
                     docs, tf = docs[admissible], tf[admissible]
 
             if gate is not None and not is_literal:
-                keep = gate[idx.doc_topic[docs]]
+                keep = gate[docs]
                 if not keep.any():
                     continue
                 docs, tf = docs[keep], tf[keep]
@@ -368,18 +427,29 @@ class Router:
             if n_touched >= cfg.budget:
                 exhausted = True
                 break
-            if n_touched + docs.size > cfg.budget:
+
+            # Only *fresh* documents cost budget: re-scoring a doc an earlier
+            # term already touched is free. Counting `docs.size` here declared
+            # the budget exhausted on terms whose posting lists overlapped
+            # heavily with ones already walked, cutting the query short and
+            # setting `budget_exhausted` when nothing had actually been spent.
+            fresh = ~self._seen[docs]
+            n_fresh = int(fresh.sum())
+            if n_touched + n_fresh > cfg.budget:
                 # Partial admission: keep the highest-tf docs of this term.
+                # Already-seen docs are free, so they ride along regardless.
                 room = cfg.budget - n_touched
-                sel = np.argpartition(-tf, room - 1)[:room]
-                docs, tf = docs[sel], tf[sel]
+                fresh_pos = np.flatnonzero(fresh)
+                sel = fresh_pos[np.argpartition(-tf[fresh_pos], room - 1)[:room]]
+                sel = np.concatenate([np.flatnonzero(~fresh), sel])
+                sel.sort()
+                docs, tf, fresh = docs[sel], tf[sel], fresh[sel]
                 exhausted = True
 
             length = idx.doc_len[docs]
             denom = tf + k1 * (1.0 - b + b * length / avg_len)
             contrib = (float(idx.idf[tid]) * w) * (tf * (k1 + 1.0) / denom)
 
-            fresh = ~self._seen[docs]
             if fresh.any():
                 new_docs = docs[fresh]
                 self._seen[new_docs] = True

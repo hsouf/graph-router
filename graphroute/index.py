@@ -54,14 +54,27 @@ class IndexConfig:
     graph_degree: int = 24
     """Max neighbours kept per node. Bounds per-hop branching at query time."""
     min_pair: int = 2
-    """Minimum co-occurrence count for an edge to exist at all."""
+    """Minimum co-occurrence count for an edge to exist at all. Scaled up on
+    large corpora (see `build_index`): two co-occurrences out of a million
+    documents is noise, out of a thousand it is a signal."""
 
     # --- communities ---
     lp_iterations: int = 10
+    max_doc_topics: int = 3
+    """How many communities a document may belong to. Documents are not
+    single-topic — a chapter on leukemia treatment is oncology *and*
+    pharmacology — and forcing an argmax makes the topic gate reject it for
+    half the queries it should answer."""
+    min_topic_share: float = 0.15
+    """A topic must hold at least this share of a document's anchor mass to
+    count as one of its topics. Keeps the tail of incidental vocabulary from
+    making every document a member of every community."""
 
     # --- ingest ---
     include_ext: Optional[Sequence[str]] = None
     max_file_bytes: int = 2_000_000
+    pdf_max_pages: Optional[int] = None
+    """Stop reading each PDF after this many pages. None reads all of them."""
 
 
 @dataclass
@@ -93,6 +106,7 @@ class GraphIndex:
         doc_topic: np.ndarray,
         config: IndexConfig,
         stats: IndexStats,
+        doc_topics: Optional[sp.csr_matrix] = None,
     ):
         self.paths = paths
         self.terms = terms
@@ -104,7 +118,7 @@ class GraphIndex:
         self.anchor_terms = anchor_terms  # anchor id -> term id
         self.adj = adj                    # anchor x anchor, row-normalised
         self.community = community        # anchor id -> topic id
-        self.doc_topic = doc_topic        # doc id -> topic id
+        self.doc_topic = doc_topic        # doc id -> dominant topic id (argmax)
         self.config = config
         self.stats = stats
 
@@ -113,7 +127,24 @@ class GraphIndex:
         self.idf = np.log(1.0 + (self.n_docs - df + 0.5) / (df + 0.5)).astype(np.float32)
 
         n_topics = int(doc_topic.max()) + 1 if doc_topic.size else 0
+        if doc_topics is not None:
+            n_topics = max(n_topics, doc_topics.shape[1])
         self.n_topics = n_topics
+
+        # Soft membership: doc id -> the handful of topics it belongs to.
+        # `doc_topic` above is the argmax, kept for stats and for anything that
+        # wants one label per file; the gate uses this.
+        if doc_topics is None:
+            rows = np.arange(self.n_docs, dtype=np.int64)
+            doc_topics = sp.csr_matrix(
+                (np.ones(self.n_docs, dtype=np.uint8), (rows, doc_topic[: self.n_docs])),
+                shape=(self.n_docs, max(n_topics, 1)),
+            )
+        self.doc_topics = doc_topics.tocsr()
+        # A document with no anchors has no topics at all, and must pass every
+        # gate rather than being parked in topic 0 where only queries that
+        # happen to select topic 0 can ever reach it.
+        self.doc_untopiced = np.diff(self.doc_topics.indptr) == 0
         order = np.argsort(doc_topic, kind="stable")
         counts = np.bincount(doc_topic, minlength=n_topics) if n_topics else np.zeros(0, int)
         self.topic_doc_ptr = np.concatenate([[0], np.cumsum(counts)]).astype(np.int64)
@@ -139,6 +170,9 @@ class GraphIndex:
             adj_shape=np.array(self.adj.shape),
             community=self.community,
             doc_topic=self.doc_topic,
+            doc_topics_indices=self.doc_topics.indices,
+            doc_topics_indptr=self.doc_topics.indptr,
+            doc_topics_shape=np.array(self.doc_topics.shape),
         )
         with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("arrays.npz", buf.getvalue())
@@ -165,6 +199,16 @@ class GraphIndex:
             (arrays["adj_data"], arrays["adj_indices"], arrays["adj_indptr"]),
             shape=tuple(arrays["adj_shape"]),
         )
+        doc_topics = None
+        if "doc_topics_indptr" in arrays:
+            # Membership is a boolean relation; only the sparsity pattern is
+            # stored and the data array is reconstituted as ones.
+            indices = arrays["doc_topics_indices"]
+            doc_topics = sp.csr_matrix(
+                (np.ones(indices.size, dtype=np.uint8),
+                 indices, arrays["doc_topics_indptr"]),
+                shape=tuple(arrays["doc_topics_shape"]),
+            )
         return cls(
             paths=paths,
             terms=terms,
@@ -178,6 +222,7 @@ class GraphIndex:
             doc_topic=arrays["doc_topic"],
             config=IndexConfig(**meta["config"]),
             stats=IndexStats(**meta["stats"]),
+            doc_topics=doc_topics,
         )
 
     # -------------------------------------------------------------- helpers
@@ -189,6 +234,23 @@ class GraphIndex:
             if 0 <= t < self.n_topics
         ]
         return np.concatenate(chunks) if chunks else np.empty(0, dtype=np.int64)
+
+    def topic_gate_mask(self, topics: Iterable[int]) -> np.ndarray:
+        """Boolean array over documents: True if `topics` admits the document.
+
+        A document passes if *any* of its topics was selected, or if it has no
+        topics at all. One sparse mat-vec over `doc_topics` answers it for the
+        whole corpus at once — O(nnz) with nnz <= max_doc_topics * n_docs — so
+        the gate stays a vectorised array lookup inside the postings walk
+        rather than a per-document test.
+        """
+        sel = np.zeros(self.doc_topics.shape[1], dtype=np.uint8)
+        chosen = [t for t in topics if 0 <= t < sel.size]
+        if not chosen:
+            return np.ones(self.n_docs, dtype=bool)
+        sel[chosen] = 1
+        hit = (self.doc_topics @ sel) > 0
+        return hit | self.doc_untopiced
 
     def mask_where(self, predicate) -> np.ndarray:
         """Build a `doc_filter` mask from a predicate over file paths.
@@ -235,10 +297,15 @@ def _accumulate(docs: Iterable[Document], cfg: IndexConfig):
             continue
         # Structural neighbours are folded in as pseudo-terms so that an import
         # graph or a wiki link graph contributes edges for free.
-        for link in doc.links:
-            counts["link:" + os.path.basename(link).lower()] = (
-                counts.get("link:" + os.path.basename(link).lower(), 0) + 2
-            )
+        #
+        # Every document also emits its *own* name as a link term. Without it
+        # the pseudo-term for `spec.md` appears only in the documents citing
+        # spec.md and never in spec.md itself, so the graph learns co-citation
+        # (two documents that cite the same third) but never citer -> citee —
+        # the edge the link graph was added for.
+        for link in [doc.path] + list(doc.links):
+            key = "link:" + os.path.basename(link).lower()
+            counts[key] = counts.get(key, 0) + 2
 
         doc_idx = len(paths)
         paths.append(doc.path)
@@ -316,6 +383,42 @@ def _doc_anchor_topk(
     return top
 
 
+def _soft_doc_topics(
+    doc_topic_mass: sp.csr_matrix, max_topics: int, min_share: float
+) -> sp.csr_matrix:
+    """Boolean doc x topic membership: the top `max_topics` topics per document
+    holding at least `min_share` of that document's anchor mass.
+
+    Fully vectorised over the nonzeros of `doc_topic_mass`: rows are sorted by
+    descending mass with one lexsort, and a row-local rank falls out of
+    subtracting each row's start offset from `arange`, so there is no per-
+    document Python loop.
+    """
+    mat = doc_topic_mass.tocsr()
+    n_docs, n_topics = mat.shape
+    if mat.nnz == 0:
+        return sp.csr_matrix((n_docs, max(n_topics, 1)), dtype=np.uint8)
+
+    counts = np.diff(mat.indptr)
+    rows = np.repeat(np.arange(n_docs, dtype=np.int64), counts)
+    totals = np.asarray(mat.sum(axis=1)).ravel()
+
+    order = np.lexsort((-mat.data, rows))          # by row, then heaviest first
+    rank = np.arange(mat.nnz) - np.repeat(mat.indptr[:-1], counts)
+    keep = (rank < max_topics) & (
+        mat.data[order] >= min_share * np.repeat(totals, counts)
+    )
+
+    out = sp.csr_matrix(
+        (np.ones(int(keep.sum()), dtype=np.uint8),
+         (rows[keep], mat.indices[order][keep])),
+        shape=(n_docs, n_topics),
+    )
+    out.sum_duplicates()
+    out.data[:] = 1
+    return out
+
+
 def build_index(
     source,
     config: Optional[IndexConfig] = None,
@@ -326,7 +429,12 @@ def build_index(
     t0 = time.time()
 
     docs = (
-        walk(source, include_ext=cfg.include_ext, max_bytes=cfg.max_file_bytes)
+        walk(
+            source,
+            include_ext=cfg.include_ext,
+            max_bytes=cfg.max_file_bytes,
+            max_pdf_pages=cfg.pdf_max_pages,
+        )
         if isinstance(source, (str, os.PathLike))
         else source
     )
@@ -361,7 +469,11 @@ def build_index(
         print(f"[index] {anchors.size:,} anchor terms{note}")
 
     doc_anchor = _doc_anchor_topk(doc_term, anchors, idf, cfg.graph_terms_per_doc)
-    adj = G.cooccurrence(doc_anchor, weight="npmi", min_pair=cfg.min_pair)
+    # A fixed floor of 2 co-occurrences means something different at 1,000
+    # documents than at 5,000,000, where a pair of unrelated terms lands in the
+    # same document twice by accident. Scale the floor with the corpus.
+    min_pair = max(cfg.min_pair, n_docs // 50_000)
+    adj = G.cooccurrence(doc_anchor, weight="npmi", min_pair=min_pair)
     adj = G.prune_topk(adj, cfg.graph_degree)
     adj = adj.maximum(adj.T)          # symmetrise after pruning
     adj_norm = G.row_normalize(adj)
@@ -377,9 +489,12 @@ def build_index(
         # Degrade to a single shard so the inverted index still works rather
         # than failing the build.
         doc_topic = np.zeros(n_docs, dtype=np.int32)
+        doc_topics = sp.csr_matrix((n_docs, 1), dtype=np.uint8)
     else:
-        # Project topics onto documents: a doc belongs to the topic holding
-        # most of its anchor mass. Anchor-less docs land in topic 0.
+        # Project topics onto documents. Membership is soft: a document belongs
+        # to every topic holding a real share of its anchor mass, up to
+        # `max_doc_topics`. `doc_topic` keeps the argmax for stats and for
+        # callers that want one label per file.
         onehot = sp.csr_matrix(
             (np.ones(community.size, dtype=np.float32),
              (np.arange(community.size), community)),
@@ -387,7 +502,12 @@ def build_index(
         )
         doc_topic_mass = (doc_anchor @ onehot).tocsr()
         doc_topic = np.asarray(doc_topic_mass.argmax(axis=1)).ravel().astype(np.int32)
+        # Anchor-less docs get no topics at all — not topic 0, which would make
+        # them reachable only by queries that happen to select topic 0.
         doc_topic[np.diff(doc_topic_mass.indptr) == 0] = 0
+        doc_topics = _soft_doc_topics(
+            doc_topic_mass, cfg.max_doc_topics, cfg.min_topic_share
+        )
 
     sizes = np.bincount(doc_topic, minlength=n_topics)
     stats = IndexStats(
@@ -414,6 +534,7 @@ def build_index(
         doc_topic=doc_topic,
         config=cfg,
         stats=stats,
+        doc_topics=doc_topics,
     )
     if verbose:
         print("[index] " + index.summary())

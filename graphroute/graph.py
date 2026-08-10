@@ -46,14 +46,30 @@ def prune_topk(mat: sp.csr_matrix, k: int) -> sp.csr_matrix:
     return out
 
 
+SUPPORT_SATURATION = 8.0
+"""Joint count at which the NPMI support discount reaches 1.0."""
+
+
 def cooccurrence(
-    doc_term: sp.csr_matrix, weight: str = "npmi", min_pair: int = 2
+    doc_term: sp.csr_matrix,
+    weight: str = "npmi",
+    min_pair: int = 2,
+    support_saturation: float = SUPPORT_SATURATION,
 ) -> sp.csr_matrix:
     """Term-term graph from a document-term matrix.
 
     `npmi` normalises away raw frequency, so a rare term co-occurring with
     another rare term outranks anything that merely shares space with a hub.
     That is what lets the graph carry *topical* rather than *popular* signal.
+
+    NPMI alone has a sharp edge: it is exactly 1.0 for *any* pair that always
+    co-occurs, including a pair seen together twice in the whole corpus. Left
+    uncorrected, the least-supported edges in the graph are also the strongest,
+    and a degree-capped neighbour list fills up with coincidences before it
+    reaches the terms a topic is actually built from. Scaling by
+    `log1p(joint) / log1p(support_saturation)` — capped at 1.0 — keeps NPMI's
+    shape while requiring a pair to be seen `support_saturation` times before
+    it can claim full strength. Two co-occurrences buy half the weight of eight.
     """
     binary = doc_term.copy().tocsr()
     binary.data = np.ones_like(binary.data, dtype=np.float32)
@@ -78,6 +94,11 @@ def cooccurrence(
             npmi = pmi / -np.log(p_xy)
         vals = np.nan_to_num(npmi, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
         vals = np.clip(vals, 0.0, None)
+        if support_saturation > 1:
+            support = np.minimum(
+                1.0, np.log1p(joint) / np.log1p(support_saturation)
+            ).astype(np.float32)
+            vals = vals * support
 
     keep = vals > 0
     return sp.csr_matrix(

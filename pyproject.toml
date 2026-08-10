@@ -7,11 +7,13 @@ name = "graphroute"
 version = "0.1.0"
 description = "Graph-based file router for RAG: narrow millions of files to hundreds before you read anything."
 requires-python = ">=3.9"
+license = {text = "MIT"}
 dependencies = ["numpy>=1.24", "scipy>=1.10"]
 
 [project.optional-dependencies]
-dev = ["pytest>=7"]
+dev = ["pytest>=7", "pypdf>=4"]
 rich = ["pypdf>=4", "python-docx>=1.1"]
+embed = ["sentence-transformers>=2.2"]
 
 [project.scripts]
 graphroute = "graphroute.cli:main"

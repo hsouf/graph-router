@@ -16,8 +16,10 @@ TEXT_EXT = {
     ".txt", ".md", ".markdown", ".rst", ".log", ".csv", ".tsv",
     ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".go", ".rs", ".rb", ".php",
     ".c", ".h", ".cpp", ".hpp", ".cs", ".swift", ".kt", ".scala", ".sql",
-    ".sh", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".env",
+    ".sh", ".yaml", ".yml", ".toml", ".ini", ".cfg",
 }
+# `.env` is deliberately absent: those files are credentials, and a router that
+# indexes them will happily route a question to them.
 JSON_EXT = {".json", ".jsonl", ".ndjson"}
 HTML_EXT = {".html", ".htm", ".xml"}
 PDF_EXT = {".pdf"}
@@ -70,8 +72,15 @@ def _flatten_json(obj, out: List[str], depth: int = 0) -> None:
         out.append(str(obj))
 
 
-def extract_text(path: str, max_bytes: int = 2_000_000) -> Optional[str]:
-    """Return plain text for a file, or None if the format is unsupported."""
+def extract_text(
+    path: str, max_bytes: int = 2_000_000, max_pages: Optional[int] = None
+) -> Optional[str]:
+    """Return plain text for a file, or None if the format is unsupported.
+
+    `max_pages` caps how many pages of a PDF are read. None means all of them —
+    a book is not a 50-page document, and silently truncating one produces an
+    index that is confidently missing two thirds of its own corpus.
+    """
     ext = os.path.splitext(path)[1].lower()
     try:
         if ext in TEXT_EXT or ext == "":
@@ -96,7 +105,8 @@ def extract_text(path: str, max_bytes: int = 2_000_000) -> Optional[str]:
             except ImportError:
                 return None
             reader = PdfReader(path)
-            return "\n".join((p.extract_text() or "") for p in reader.pages[:50])
+            pages = reader.pages if max_pages is None else reader.pages[:max_pages]
+            return "\n".join((p.extract_text() or "") for p in pages)
         if ext in DOCX_EXT:
             try:
                 import docx  # optional extra
@@ -129,13 +139,23 @@ def extract_links(text: str, limit: int = 64) -> List[str]:
     return out
 
 
+_extract_links = extract_links
+"""Module-local alias: `walk` takes a parameter of the same name."""
+
+
 def walk(
     root: str,
     include_ext: Optional[Sequence[str]] = None,
     max_bytes: int = 2_000_000,
-    follow_links: bool = True,
+    extract_links: bool = True,
+    max_pdf_pages: Optional[int] = None,
 ) -> Iterator[Document]:
-    """Yield Documents under `root`, skipping vendor/VCS directories."""
+    """Yield Documents under `root`, skipping vendor/VCS directories.
+
+    `extract_links` controls whether markdown links and import statements are
+    mined for structural edges. It has nothing to do with filesystem symlinks,
+    which this walker never follows.
+    """
     allow = set(e.lower() for e in include_ext) if include_ext else None
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
@@ -150,8 +170,25 @@ def walk(
                 size = os.path.getsize(path)
             except OSError:
                 continue
-            text = extract_text(path, max_bytes=max_bytes)
+            text = extract_text(path, max_bytes=max_bytes, max_pages=max_pdf_pages)
             if not text or not text.strip():
                 continue
-            links = extract_links(text) if follow_links else []
+            links = _extract_links(text) if extract_links else []
             yield Document(path=path, text=text, size=size, links=links)
+
+
+def walk_sections(root: str, **kwargs) -> Iterator[Document]:
+    """Yield one Document per *section* rather than per file.
+
+    Identical contract to `walk`, so `build_index` and everything downstream is
+    unchanged — the only difference is that a document is now a chapter of a
+    book instead of a whole book, and its path carries a `#s<n>` fragment
+    identifying which one. That single substitution moves the entire router
+    from file granularity to section granularity.
+
+    Keyword arguments are forwarded to `sections.collect_sections`.
+    """
+    from .sections import collect_sections
+
+    for sec in collect_sections(root, **kwargs):
+        yield Document(path=sec.doc_path, text=sec.full_text, size=len(sec.full_text))
