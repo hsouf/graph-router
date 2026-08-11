@@ -218,6 +218,12 @@ def salient_terms(index, doc_ids: Sequence[int], k: int = TOP_TERMS) -> List[Lis
 def embedding_text(section, terms: Sequence[str]) -> str:
     """The string actually embedded for a section."""
     parts = [section.breadcrumb]
+    # Headings the breadcrumb cannot show, because several outline entries share
+    # this section's page span. They are real headings the reader may search by,
+    # and only the breadcrumb channel would otherwise lose them.
+    also = list(dict.fromkeys(getattr(section, "also_titles", None) or []))
+    if also:
+        parts.append(" (" + "; ".join(also) + ")")
     if section.first_para:
         parts.append(" — " + section.first_para)
     if terms:

@@ -23,6 +23,7 @@ Nothing here calls a model. pypdf is an optional dependency (`[rich]` extra).
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from bisect import bisect_right
@@ -74,6 +75,11 @@ class Section:
     instead of to the section's whole range."""
     tier: str = "outline"
     """Which extraction tier produced this: outline | headings | windows."""
+    also_titles: List[str] = field(default_factory=list)
+    """Other headings that start inside this section's page span. Populated when
+    several outline entries share a page and were folded into one section, so
+    the headings the breadcrumb cannot show are still available to the embedder
+    rather than thrown away."""
 
     @property
     def doc_path(self) -> str:
@@ -99,6 +105,7 @@ class Section:
             "index": self.index,
             "page_offsets": self.page_offsets,
             "tier": self.tier,
+            "also_titles": self.also_titles,
         }
 
     @classmethod
@@ -156,6 +163,34 @@ def _join_pages(
     return "".join(parts).strip(), offsets
 
 
+def _drop_duplicate_text(sections: List[Section]) -> List[Section]:
+    """Drop sections whose text an earlier section already carries verbatim.
+
+    A backstop under the tier-specific splitting, not a substitute for it: a
+    malformed outline whose destinations run backwards, a heading repeated by
+    the extractor, or a book with genuinely identical pages all produce two
+    documents with one document's content. Duplicates are not harmless — each
+    copy adds to every one of its terms' document frequency, which is the
+    number idf and the router's selectivity test are computed from.
+
+    The first occurrence wins, so the surviving copy keeps the breadcrumb of
+    whichever section the splitter reached first.
+    """
+    out: List[Section] = []
+    seen = set()
+    for sec in sections:
+        # Digest rather than the text itself: the set is per-book, but a
+        # 2,000-page book is a lot of string to hold a second copy of.
+        key = hashlib.blake2b(
+            " ".join(sec.full_text.split()).encode(), digest_size=16
+        ).digest()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(sec)
+    return out
+
+
 def _merge_short(sections: List[Section]) -> List[Section]:
     """Fold sections below `MIN_SECTION_CHARS` into their predecessor.
 
@@ -176,6 +211,7 @@ def _merge_short(sections: List[Section]) -> List[Section]:
             prev.page_end = max(prev.page_end, sec.page_end)
             if not prev.first_para:
                 prev.first_para = sec.first_para
+            prev.also_titles = prev.also_titles + [sec.title] + sec.also_titles
             continue
         out.append(sec)
     for i, sec in enumerate(out):
@@ -228,6 +264,14 @@ def _sections_from_outline(
     chapter. Taking leaves alone would be tidier and would silently drop the
     text between a chapter heading and its first sub-heading, which on a real
     book is the passage that says what the chapter is about.
+
+    Entries that land on the *same* page are one span, not several. Page is the
+    finest resolution a bookmark destination gives us, so a heading and the two
+    sub-headings printed below it cannot be told apart, and giving each of them
+    the page produced three sections with byte-identical text — a third of a
+    real book's index, all of it redundant, inflating df, spending routing
+    budget and returning the same paragraph three times under three
+    breadcrumbs. They are folded into one section instead; see `also_titles`.
     """
     entries = _outline_entries(reader)
     if not entries:
@@ -242,20 +286,29 @@ def _sections_from_outline(
         ancestors_of.append([n for _d, n in stack])
         stack.append((depth, name))
 
+    # Runs of entries sharing a destination page. The first entry of a run owns
+    # the span and names it — it is the heading a reader turning to that page
+    # sees first — and the rest ride along in `also_titles`.
+    runs: List[List[int]] = []
+    for i, (_depth, _name, page) in enumerate(entries):
+        if runs and entries[runs[-1][0]][2] == page:
+            runs[-1].append(i)
+        else:
+            runs.append([i])
+
     n_pages = len(pages)
     sections: List[Section] = []
-    for i, (depth, name, page) in enumerate(entries):
+    for r, run in enumerate(runs):
+        head = run[0]
+        _depth, name, page = entries[head]
         start = max(0, min(page, n_pages - 1))
-        nxt = entries[i + 1][2] if i + 1 < len(entries) else n_pages
-        # At least one page: two bookmarks landing on the same page duplicate
-        # that page between them, which costs a little redundancy. Emitting an
-        # empty section instead would lose a heading whose entire body shares a
-        # page with its neighbour.
+        nxt = entries[runs[r + 1][0]][2] if r + 1 < len(runs) else n_pages
+        # At least one page, for an outline whose destinations run backwards.
         end = max(start + 1, min(nxt, n_pages))
         text, offsets = _join_pages(pages, start, end)
         if not text:
             continue
-        crumbs = [title] + ancestors_of[i] + [name]
+        crumbs = [title] + ancestors_of[head] + [name]
         sections.append(
             Section(
                 book_path=path,
@@ -267,6 +320,7 @@ def _sections_from_outline(
                 full_text=text,
                 page_offsets=offsets,
                 tier="outline",
+                also_titles=[entries[i][1] for i in run[1:]],
             )
         )
     return sections
@@ -426,7 +480,7 @@ def extract_sections(pdf_path: str, window: int = WINDOW_PAGES) -> List[Section]
     if not sections:
         sections = _sections_from_windows(pages, pdf_path, title, window)
 
-    sections = _merge_short(sections)
+    sections = _merge_short(_drop_duplicate_text(sections))
     return sections
 
 

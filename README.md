@@ -228,6 +228,17 @@ of the book lands in exactly one section — including the preamble between a
 chapter heading and its first sub-heading, which taking outline leaves alone
 would have dropped.
 
+*Exactly* one, which takes some care. A bookmark destination resolves to a
+page, so a heading and the two sub-headings printed below it are three entries
+pointing at the same place and indistinguishable from one another. Giving each
+of them that page made three documents holding the same text: on a real 600-page
+book, 978 sections of which only 470 were distinct. Duplicates are not free —
+each copy adds to every one of its terms' document frequency, which is the
+number idf and the router's selectivity test are computed from, and the reader
+gets the same paragraph three times under three breadcrumbs. Entries sharing a
+page are folded into one section named after the first of them, with the rest
+kept in `also_titles` so the dense channel can still match on them.
+
 **Retrieval** is two channels fused:
 
 ```
@@ -242,6 +253,18 @@ Fusion is rank-based (`Σ 1/(60 + rank)`), with no weight to tune. BM25 scores
 are unbounded sums of idf terms and cosines live in [-1, 1]; any weight
 combining them directly is a number invented to fit one corpus. RRF needs none
 and degrades gracefully when the dense channel is absent.
+
+The last step also refuses to hand back the same passage twice. Sectioning
+keeps a book from repeating itself, but a corpus can repeat itself in ways the
+splitter never sees — the same document filed under two paths, a chapter
+reprinted as an appendix — and the copies need not be byte-identical: chunked
+from a different offset, the same prose comes out shifted. Passages are
+compared as 5-word shingles and suppressed above 0.8 *containment* (overlap
+over the shorter of the two, so a passage wholly inside a longer one counts as
+a repeat, which Jaccard scores low exactly when the redundancy is total). A
+suppressed passage frees its slot for the next distinct one rather than
+shortening the answer. Repetition is worth spending code on because of how it
+reads downstream: three copies of a claim look like three sources agreeing.
 
 ### Embeddings are optional
 

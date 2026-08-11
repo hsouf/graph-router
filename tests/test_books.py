@@ -8,6 +8,7 @@ through a PDF.
 from __future__ import annotations
 
 import sys
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -28,10 +29,17 @@ from graphroute.embed import (
 )
 from graphroute.pipeline import (
     Passage,
+    _is_near_duplicate,
+    _shingles,
     paragraph_chunks,
     reciprocal_rank_fusion,
 )
-from graphroute.sections import Section, collect_sections, extract_sections
+from graphroute.sections import (
+    Section,
+    _drop_duplicate_text,
+    collect_sections,
+    extract_sections,
+)
 
 
 # ------------------------------------------------------------------ fixtures
@@ -190,6 +198,66 @@ def test_short_sections_are_merged_into_the_previous_one(tmp_path):
     assert [s.index for s in sections] == list(range(len(sections)))
 
 
+def test_outline_entries_sharing_a_page_become_one_section(tmp_path):
+    """Three bookmarks on one page are one section, not three copies of it."""
+    path = tmp_path / "crowded.pdf"
+    write_pdf_with_outline(
+        str(path),
+        [
+            ["Chapter 1 Skills"] + _body("skills capability composition", 14),
+            ["Chapter 2 Elsewhere"] + _body("unrelated material", 14),
+        ],
+        [
+            ("Agent Skills", 0, 0),
+            ("What Is a Skill?", 0, 1),
+            ("Skill Architecture", 0, 1),
+            ("Chapter 2 Elsewhere", 1, 0),
+        ],
+        title="Crowded",
+    )
+    sections = extract_sections(str(path))
+
+    page_one = [s for s in sections if s.page_start == 1]
+    assert len(page_one) == 1, [s.breadcrumb for s in page_one]
+
+    # The first heading on the page names the section; the ones folded into it
+    # are kept rather than discarded.
+    sec = page_one[0]
+    assert sec.breadcrumb == "Crowded › Agent Skills"
+    assert sec.also_titles == ["What Is a Skill?", "Skill Architecture"]
+
+    texts = [s.full_text for s in sections]
+    assert len(set(texts)) == len(texts), "no section repeats another's text"
+
+
+def test_folded_headings_survive_into_the_embedded_text():
+    section = Section(
+        book_path="b.pdf",
+        breadcrumb="Book › Agent Skills",
+        page_start=1,
+        page_end=1,
+        title="Agent Skills",
+        first_para="Skills bundle prompts and tools.",
+        full_text="Skills bundle prompts and tools.",
+        also_titles=["What Is a Skill?", "What Is a Skill?"],
+    )
+    text = embedding_text(section, ["skill", "tool"])
+    assert "Agent Skills" in text
+    assert text.count("What Is a Skill?") == 1, "folded headings are deduplicated"
+
+
+def test_duplicate_sections_are_dropped(tmp_path):
+    """Two sections with byte-identical text are one document, not two."""
+    duplicate = "identical body text repeated verbatim in both sections. " * 8
+    sections = [
+        Section("b.pdf", "Book › One", 1, 1, "One", "", duplicate),
+        Section("b.pdf", "Book › Two", 2, 2, "Two", "", duplicate),
+        Section("b.pdf", "Book › Three", 3, 3, "Three", "", "genuinely other text"),
+    ]
+    kept = _drop_duplicate_text(sections)
+    assert [s.title for s in kept] == ["One", "Three"], "the first copy wins"
+
+
 def test_book_title_falls_back_to_the_filename(tmp_path):
     path = tmp_path / "some_untitled-book.pdf"
     write_pdf(str(path), HEMA_PAGES)      # no /Title
@@ -297,6 +365,93 @@ def test_paragraph_chunk_offsets_point_into_the_source():
         assert text[offset:offset + 5] == chunk[:5]
 
 
+def test_near_duplicate_detects_containment_not_just_equality():
+    long = " ".join(f"word{i}" for i in range(60))
+    inside = " ".join(f"word{i}" for i in range(10, 50))
+    other = " ".join(f"other{i}" for i in range(60))
+
+    assert _is_near_duplicate(_shingles(long), [_shingles(long)])
+    assert _is_near_duplicate(_shingles(inside), [_shingles(long)]), (
+        "a passage wholly inside a longer one repeats it"
+    )
+    assert not _is_near_duplicate(_shingles(other), [_shingles(long)])
+    assert not _is_near_duplicate(_shingles(""), [_shingles(long)])
+
+
+def test_near_duplicate_ignores_whitespace_and_case():
+    a = "The agent observes the environment and then acts upon it."
+    b = "THE  AGENT   observes the\nenvironment and then acts upon it."
+    assert _is_near_duplicate(_shingles(b), [_shingles(a)])
+
+
+def test_repeated_passages_are_not_returned_twice(tmp_path):
+    """A corpus that says the same thing twice answers with it once.
+
+    Section-level dedup is per book, so a duplicated *file* still reaches the
+    passage stage — which is the stage that has to hold the line, and the one
+    this exercises end to end. The near-copy is not byte-identical: its offsets
+    are shifted by an extra opening line, so exact matching alone would let it
+    through.
+    """
+    body = "\n\n".join(
+        f"Leukemia is a malignant proliferation of haematopoietic precursors "
+        f"that accumulate in the marrow and displace normal haematopoiesis, "
+        f"paragraph {i} of the discussion."
+        for i in range(6)
+    )
+    shelf = tmp_path / "shelf"
+    shelf.mkdir()
+    (shelf / "original.md").write_text(body)
+    (shelf / "copy.md").write_text("A note before the copy begins.\n\n" + body)
+    (shelf / "other.md").write_text(
+        "\n\n".join(
+            f"Induction chemotherapy is followed by consolidation and then "
+            f"maintenance in childhood leukemia, paragraph {i}."
+            for i in range(6)
+        )
+    )
+
+    found = ask(
+        str(shelf),
+        "leukemia in the marrow",
+        passages=6,
+        cache_dir=str(tmp_path / "cache"),
+        embed=False,
+    )
+    assert found
+
+    kept: list = []
+    for passage in found:
+        shingles = _shingles(passage.text)
+        assert not _is_near_duplicate(shingles, kept), (
+            f"passage repeats an earlier one: {passage.text[:80]!r}"
+        )
+        kept.append(shingles)
+
+
+def test_suppressed_duplicates_free_their_slot(tmp_path):
+    """Dropping a repeat promotes the next distinct passage, not a short list."""
+    paragraphs = [
+        f"\n\nDistinct paragraph {i} discusses erythropoiesis in the marrow "
+        f"with enough specific wording to stand on its own here." * 3
+        for i in range(8)
+    ]
+    shelf = tmp_path / "shelf"
+    shelf.mkdir()
+    (shelf / "a.md").write_text("".join(paragraphs))
+    (shelf / "b.md").write_text("".join(paragraphs))       # exact duplicate file
+
+    found = ask(
+        str(shelf),
+        "erythropoiesis marrow",
+        passages=5,
+        cache_dir=str(tmp_path / "cache"),
+        embed=False,
+    )
+    assert len(found) == 5, [p.text[:40] for p in found]
+    assert len({p.text for p in found}) == 5
+
+
 # --------------------------------------------------------------- embeddings
 
 
@@ -305,13 +460,18 @@ def _stub_embedder(dim: int = 24):
 
     Not a good embedding — good enough to prove the plumbing is right without
     downloading a model, which is exactly what the pluggable `embed_fn` is for.
+
+    `zlib.crc32` rather than `hash()`: Python randomises string hashing per
+    process, so `hash()` made the vectors — and every ranking downstream of
+    them — differ between runs of the same code. That is a test that fails a
+    few runs in a hundred for no reason anyone can reproduce.
     """
 
     def encode(texts):
         out = np.zeros((len(texts), dim), dtype=np.float32)
         for i, text in enumerate(texts):
             for word in text.lower().split():
-                out[i, hash(word) % dim] += 1.0
+                out[i, zlib.crc32(word.encode()) % dim] += 1.0
         return out
 
     return encode

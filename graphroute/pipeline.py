@@ -52,7 +52,18 @@ CHUNK_MIN, CHUNK_MAX = 300, 900
 """Target passage size in characters. Below the minimum a paragraph is a
 fragment with no context; above the maximum it stops being a passage."""
 
+SHINGLE_WORDS = 5
+"""Word n-gram size for near-duplicate detection between passages."""
+
+NEAR_DUPLICATE = 0.8
+"""Shingle overlap above which two passages are the same passage. Measured as
+containment — the overlap over the *smaller* passage — not Jaccard, because the
+common case is one passage wholly inside a longer one (the same prose chunked
+from two different offsets), which Jaccard scores low precisely when the
+redundancy is total."""
+
 _PARA_SPLIT_RE = re.compile(r"\n\s*\n+")
+_WS_COLLAPSE_RE = re.compile(r"\s+")
 
 
 # ------------------------------------------------------------------ results
@@ -98,6 +109,13 @@ class Corpus:
 # -------------------------------------------------------------- build/cache
 
 
+CACHE_VERSION = 2
+"""Bumped whenever a code change alters what gets cached. Without it an
+existing cache outlives the code that produced it: the fingerprint tracks the
+corpus, and a corpus nobody edited would keep serving sections built by the old
+splitter. Version 2 folds same-page outline entries into one section."""
+
+
 def corpus_fingerprint(source: str, include_ext: Optional[Sequence[str]] = None) -> str:
     """Hash of what the corpus *is*: every file's path, size and mtime.
 
@@ -109,6 +127,7 @@ def corpus_fingerprint(source: str, include_ext: Optional[Sequence[str]] = None)
     from .sections import _iter_files
 
     h = hashlib.sha1()
+    h.update(f"v{CACHE_VERSION}".encode())
     h.update(os.path.abspath(source).encode())
     for path in sorted(_iter_files(source, include_ext)):
         try:
@@ -337,6 +356,40 @@ def _lexical_chunk_scores(
     return scores
 
 
+def _text_key(text: str) -> str:
+    """Identity of a passage for exact-duplicate purposes."""
+    return _WS_COLLAPSE_RE.sub(" ", text).strip().lower()
+
+
+def _shingles(text: str, n: int = SHINGLE_WORDS) -> frozenset:
+    """Word n-grams of `text`, the unit near-duplicate overlap is measured in."""
+    words = _text_key(text).split()
+    if len(words) <= n:
+        return frozenset([" ".join(words)]) if words else frozenset()
+    return frozenset(
+        " ".join(words[i : i + n]) for i in range(len(words) - n + 1)
+    )
+
+
+def _is_near_duplicate(
+    candidate: frozenset, kept: Sequence[frozenset], threshold: float = NEAR_DUPLICATE
+) -> bool:
+    """Does `candidate` repeat something already selected?
+
+    Linear over what has been kept, which is bounded by the requested passage
+    count — a handful of set intersections per candidate.
+    """
+    if not candidate:
+        return False
+    for other in kept:
+        if not other:
+            continue
+        overlap = len(candidate & other)
+        if overlap and overlap / min(len(candidate), len(other)) >= threshold:
+            return True
+    return False
+
+
 def _normalize(x: np.ndarray) -> np.ndarray:
     """Min-max to [0, 1]; a flat vector contributes nothing rather than NaN."""
     if x.size == 0:
@@ -486,12 +539,22 @@ def _select_passages(
     query_vec,
     embed_fn,
 ) -> List[Passage]:
+    # Exact repeats are dropped here rather than at selection: an identical
+    # chunk reaching the scorer would be embedded a second time, and embedding
+    # is the one expensive thing this function does. Sections arrive in fused
+    # rank order, so the copy that survives is the one from the section the two
+    # retrieval channels liked best.
     chunks: List[Tuple[Section, int, str]] = []
+    seen: set = set()
     for doc_id in doc_ids:
         section = corpus.section_of_doc(doc_id)
         if section is None:
             continue
         for offset, text in paragraph_chunks(section.full_text):
+            key = _text_key(text)
+            if key in seen:
+                continue
+            seen.add(key)
             chunks.append((section, offset, text))
     if not chunks:
         return []
@@ -513,13 +576,28 @@ def _select_passages(
         )
 
     total = lex + dense
-    take = min(passages, total.size)
-    order = np.argpartition(-total, take - 1)[:take]
+
+    # Rank a pool rather than exactly `passages`, so suppressing a near-duplicate
+    # promotes the next distinct passage instead of shortening the answer. The
+    # pool is bounded: without it a pathological corpus would sort every chunk
+    # of every surviving section.
+    pool = min(total.size, max(passages * 8, passages + 32))
+    order = np.argpartition(-total, pool - 1)[:pool]
     order = order[np.argsort(-total[order])]
 
     out: List[Passage] = []
+    kept: List[frozenset] = []
     for i in order.tolist():
+        if len(out) >= passages:
+            break
         section, offset, text = chunks[i]
+        # Two sections overlapping by a page, or the same prose chunked from
+        # different offsets, put the same passage in front of the reader twice.
+        # It reads as corroboration and is not.
+        shingles = _shingles(text)
+        if _is_near_duplicate(shingles, kept):
+            continue
+        kept.append(shingles)
         start = section.page_of(offset)
         end = section.page_of(offset + len(text) - 1)
         out.append(
