@@ -154,7 +154,7 @@ graphroute ask ./hematology.pdf "how is it treated"
 ```
 
 ```
-[Williams Hematology › Ch 88: Acute Lymphoblastic Leukemia › p.3]
+[Hematology Primer › Ch 88: Acute Lymphoblastic Leukemia › p.3]
 Chapter 88 Acute Lymphoblastic Leukemia
 Leukemia is a malignant proliferation of haematopoietic precursor cells
 that accumulate in the bone marrow and displace normal haematopoiesis.
@@ -163,14 +163,14 @@ commonest malignancy of childhood, with a peak incidence between two and
 five years of age. Patients present with fatigue, pallor, bruising and
 recurrent infection, all consequences of marrow replacement by blasts.
 
-[Williams Hematology › Ch 89: Chronic Myeloid Leukemia › p.6]
+[Hematology Primer › Ch 89: Chronic Myeloid Leukemia › p.6]
 Chapter 89 Chronic Myeloid Leukemia
 Chronic myeloid leukemia is defined by the Philadelphia chromosome, a
 translocation between chromosomes nine and twenty two producing the BCR
 ABL fusion kinase. Tyrosine kinase inhibitors transformed this disease
 from uniformly fatal to a chronic condition managed with a daily tablet.
 
-[Williams Hematology › Ch 88: Acute Lymphoblastic Leukemia › Diagnosis › p.4]
+[Hematology Primer › Ch 88: Acute Lymphoblastic Leukemia › Diagnosis › p.4]
 Diagnosis of acute lymphoblastic leukemia
 Diagnosis requires bone marrow aspiration demonstrating at least twenty
 percent lymphoblasts. Immunophenotyping by flow cytometry distinguishes
@@ -188,11 +188,11 @@ Output is ready to paste into an LLM context. Same thing from Python:
 from graphroute import ask
 
 for p in ask("./books/", "what is leukemia", passages=8):
-    print(p.header())   # [Williams Hematology › Ch 88: ... › p.1721]
+    print(p.header())   # [Hematology Primer › Ch 88: ... › p.1721]
     print(p.text)
 
-    p.breadcrumb        # 'Williams Hematology › Ch 88: Acute Lymphoblastic Leukemia'
-    p.book_path         # '/books/williams-hematology.pdf'
+    p.breadcrumb        # 'Hematology Primer › Ch 88: Acute Lymphoblastic Leukemia'
+    p.book_path         # '/books/hematology-primer.pdf'
     p.pages             # (1721, 1721) — 1-based, inclusive
     p.score             # fused chunk score, comparable within one call only
 ```
@@ -452,3 +452,7 @@ A `GraphIndex` is read-only and safe to share. A `Router` is **not**: its
 scratch buffers are allocated once and reused across queries, which is what
 keeps per-query allocation proportional to files touched rather than to the
 corpus. Use one `Router` per thread over one shared index.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

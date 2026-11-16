@@ -122,7 +122,7 @@ def write_pdf_with_outline(
     parents: dict = {}
     for name, page_index, level in outline:
         parent = parents.get(level - 1) if level else None
-        ref = writer.add_outline_item(name, page_index, parent=parent)
+        ref = writer.add_outline_item(title=name, page_number=page_index, parent=parent)
         parents[level] = ref
         for deeper in [k for k in parents if k > level]:
             parents.pop(deeper)

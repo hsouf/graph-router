@@ -1,19 +1,43 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "graphroute"
 version = "0.1.0"
-description = "Graph-based file router for RAG: narrow millions of files to hundreds before you read anything."
+description = "Lexical file router for RAG: narrow a large corpus to a few hundred candidate files before retrieval. NumPy and SciPy only, no models."
+readme = "README.md"
 requires-python = ">=3.9"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "hsouf"}]
+keywords = ["rag", "retrieval", "bm25", "information-retrieval", "search", "pdf"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Topic :: Text Processing :: Indexing",
+]
 dependencies = ["numpy>=1.24", "scipy>=1.10"]
 
 [project.optional-dependencies]
 dev = ["pytest>=7", "pypdf>=4"]
 rich = ["pypdf>=4", "python-docx>=1.1"]
 embed = ["sentence-transformers>=2.2"]
+
+[project.urls]
+Homepage = "https://github.com/hsouf/graph-router"
+Source = "https://github.com/hsouf/graph-router"
+Issues = "https://github.com/hsouf/graph-router/issues"
 
 [project.scripts]
 graphroute = "graphroute.cli:main"

@@ -99,8 +99,8 @@ def write_books(out_dir: str) -> list:
     os.makedirs(out_dir, exist_ok=True)
     paths = [
         write_pdf_with_outline(
-            os.path.join(out_dir, "williams-hematology.pdf"),
-            HEMATOLOGY, HEMATOLOGY_OUTLINE, title="Williams Hematology",
+            os.path.join(out_dir, "hematology-primer.pdf"),
+            HEMATOLOGY, HEMATOLOGY_OUTLINE, title="Hematology Primer",
         ),
         write_pdf(
             os.path.join(out_dir, "clinical-pharmacology.pdf"),

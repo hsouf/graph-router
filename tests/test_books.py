@@ -76,9 +76,9 @@ OUTLINE = [
 
 @pytest.fixture(scope="module")
 def book_with_outline(tmp_path_factory):
-    path = tmp_path_factory.mktemp("books") / "williams-hematology.pdf"
+    path = tmp_path_factory.mktemp("books") / "hematology-primer.pdf"
     write_pdf_with_outline(
-        str(path), HEMA_PAGES, OUTLINE, title="Williams Hematology"
+        str(path), HEMA_PAGES, OUTLINE, title="Hematology Primer"
     )
     return str(path)
 
@@ -95,10 +95,10 @@ def corpus_dir(tmp_path_factory):
     """A small shelf: one book with an outline, one without, one off-topic."""
     root = tmp_path_factory.mktemp("shelf")
     write_pdf_with_outline(
-        str(root / "williams-hematology.pdf"),
+        str(root / "hematology-primer.pdf"),
         HEMA_PAGES,
         OUTLINE,
-        title="Williams Hematology",
+        title="Hematology Primer",
     )
     write_pdf(
         str(root / "clinical-pharmacology.pdf"),
@@ -129,10 +129,10 @@ def test_sections_from_outline(book_with_outline):
     assert all(s.tier == "outline" for s in sections)
 
     crumbs = [s.breadcrumb for s in sections]
-    assert all(c.startswith("Williams Hematology › ") for c in crumbs)
+    assert all(c.startswith("Hematology Primer › ") for c in crumbs)
     # Nesting is preserved: a sub-section names its parent chapter.
     assert any(
-        c == "Williams Hematology › Ch 88: Acute Lymphoblastic Leukemia › Treatment"
+        c == "Hematology Primer › Ch 88: Acute Lymphoblastic Leukemia › Treatment"
         for c in crumbs
     ), crumbs
 
@@ -556,9 +556,9 @@ def test_ask_returns_passages_from_the_right_section(corpus_dir, tmp_path):
     top = found[0]
     assert "leukemia" in top.text.lower()
     assert "Acute Lymphoblastic Leukemia" in top.breadcrumb
-    assert top.book_path.endswith("williams-hematology.pdf")
+    assert top.book_path.endswith("hematology-primer.pdf")
     assert top.pages[0] >= 1
-    assert top.header().startswith("[Williams Hematology › ")
+    assert top.header().startswith("[Hematology Primer › ")
     assert top.header().rstrip("]").endswith("p.3") or "pp." in top.header()
 
 
