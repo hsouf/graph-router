@@ -355,6 +355,47 @@ def test_budget_still_binds_on_genuinely_fresh_documents():
     assert res.budget_exhausted
 
 
+def _common_term_corpus():
+    """1,000 files of filler. 'leukemia' is in files 0-99 (10%, above the 5%
+    df ceiling); 'imatinib' is in files 90-109 (2%). Files 90-99 have both."""
+    rng = np.random.default_rng(0)
+    filler = [f"filler{i}" for i in range(400)]
+    docs = []
+    for i in range(1000):
+        words = list(rng.choice(filler, 80))
+        if i < 100:
+            words += ["leukemia"] * 3
+        if 90 <= i < 110:
+            words += ["imatinib"] * 2
+        docs.append(Document(path=f"/d/{i:04d}.txt", text=" ".join(words)))
+    return build_index(iter(docs), IndexConfig())
+
+
+def test_query_terms_above_the_df_ceiling_still_score():
+    """A common query word must still count for the files that were touched.
+
+    'leukemia' is too common to walk, so only 'imatinib' brings files in. Before
+    the rescore step 'leukemia' then contributed nothing, and the ten files
+    matching *both* words ranked below the ten matching only 'imatinib' — they
+    are longer, and BM25's length normalisation charged them for it.
+    """
+    index = _common_term_corpus()
+    res = Router(index, RouteConfig(score_floor=0.0)).route("leukemia imatinib", top_n=10)
+    both = {f"/d/{i:04d}.txt" for i in range(90, 100)}
+    assert set(res.files) == both
+    # And the ranking agrees with exhaustive BM25 on the same query.
+    ids, _ = full_scan_baseline(index, "leukemia imatinib", top_n=10)
+    assert set(res.doc_ids) == set(ids.tolist())
+
+
+def test_rescore_does_not_admit_new_files():
+    """Scoring the common term over touched files must not widen the walk."""
+    index = _common_term_corpus()
+    res = Router(index, RouteConfig(score_floor=0.0)).route("leukemia imatinib", top_n=50)
+    assert res.files_touched == 20
+    assert {int(p[3:7]) for p in res.files} <= set(range(90, 110))
+
+
 def test_router_state_is_clean_between_queries(small_index, small_corpus):
     """The scratch buffers must be fully reset, or scores leak across queries."""
     router = Router(small_index, RouteConfig(top_n=20))

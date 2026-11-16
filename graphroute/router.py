@@ -61,8 +61,11 @@ class RouteConfig:
 
     # --- postings walk ---
     df_ceiling_ratio: float = 0.05
-    """Skip expanded terms that appear in more than this fraction of files.
-    They cost budget without discriminating. Literal query terms are exempt."""
+    """Never walk the postings of a term that appears in more than this
+    fraction of files: it costs budget without discriminating. This decides
+    which files get *touched*, not how they are scored — a literal query term
+    above the ceiling still adds its BM25 contribution to every touched file
+    (see `Router._rescore`), it just cannot bring new files in."""
     literal_boost: float = 2.5
     """Exact query matches outrank graph-inferred neighbours by this factor."""
 
@@ -229,9 +232,10 @@ class Router:
             for t, w in sorted(weights.items(), key=lambda kv: -kv[1])[:32]
         ]
 
-        touched, exhausted, rejected = self._gather(
+        touched, exhausted, rejected, walked = self._gather(
             weights, set(literal_ids), topics, cfg, doc_filter
         )
+        self._rescore(touched, weights, literal_ids, walked, cfg)
         result.files_touched = int(touched.size)
         result.budget_exhausted = exhausted
         result.filtered_out = rejected
@@ -348,19 +352,21 @@ class Router:
         topics,
         cfg: RouteConfig,
         doc_filter: Optional[np.ndarray] = None,
-    ) -> Tuple[np.ndarray, bool, int]:
+    ) -> Tuple[np.ndarray, bool, int, set]:
         """Walk postings in descending term weight until the budget is spent.
 
         Returns (touched doc ids, budget exhausted, distinct docs rejected by
-        the filter).
+        the filter, term ids whose postings were scored).
         """
         idx = self.index
         post = idx.postings
         df_ceiling = max(1, int(cfg.df_ceiling_ratio * idx.n_docs))
 
         # A term is "selective" if its posting list is small enough to be worth
-        # walking. Common words fail this test, and a literal match on a common
-        # word buys nothing: its idf is near zero anyway.
+        # walking. Common words fail this test: walking them would spend the
+        # budget on files that share nothing distinctive with the query. A
+        # non-selective *literal* term is not discarded, though — `_rescore`
+        # scores it over the files the selective terms brought in.
         selective = {t for t, _ in weights.items() if idx.df[t] <= df_ceiling}
         if not selective:
             # Degenerate query (every term is a corpus stopword). Fall back to
@@ -388,6 +394,7 @@ class Router:
 
         touched_blocks: List[np.ndarray] = []
         rejected_blocks: List[np.ndarray] = []
+        walked: set = set()
         n_touched = 0
         n_rejected = 0
         exhausted = False
@@ -456,6 +463,7 @@ class Router:
                 touched_blocks.append(new_docs)
                 n_touched += int(new_docs.size)
             np.add.at(self._acc, docs, contrib.astype(np.float32))
+            walked.add(tid)
 
             if exhausted:
                 break
@@ -466,7 +474,54 @@ class Router:
         touched = (
             np.concatenate(touched_blocks) if touched_blocks else np.empty(0, dtype=np.int64)
         )
-        return touched, exhausted, n_rejected
+        return touched, exhausted, n_rejected, walked
+
+    def _rescore(
+        self,
+        touched: np.ndarray,
+        weights: Dict[int, float],
+        literal_ids: List[int],
+        walked: set,
+        cfg: RouteConfig,
+    ) -> None:
+        """Add BM25 for literal query terms whose postings were not walked.
+
+        The walk decides which files are candidates; it does not get to decide
+        that a query word stops counting. A literal term skipped for being too
+        common (df ceiling), or never reached because the budget ran out, would
+        otherwise contribute nothing — and a file matching *more* of the query
+        would then rank *below* one matching less, since its extra length costs
+        it under BM25's length normalisation while its extra match earns
+        nothing.
+
+        Each term is looked up only for the touched files, by binary search in
+        its (sorted) posting slice: O(files touched x log df) per term, no
+        budget spent, no new files admitted.
+        """
+        missing = [t for t in dict.fromkeys(literal_ids) if t not in walked]
+        if not missing or touched.size == 0:
+            return
+        idx = self.index
+        post = idx.postings
+        docs = np.sort(touched)
+        length = idx.doc_len[docs]
+        norm = cfg.k1 * (1.0 - cfg.b + cfg.b * length / (idx.avg_doc_len or 1.0))
+
+        for tid in missing:
+            start, end = post.indptr[tid], post.indptr[tid + 1]
+            if start == end:
+                continue
+            plist = post.indices[start:end]
+            pos = np.minimum(np.searchsorted(plist, docs), plist.size - 1)
+            hit = plist[pos] == docs
+            if not hit.any():
+                continue
+            tf = post.data[start:end][pos[hit]]
+            contrib = (float(idx.idf[tid]) * weights.get(tid, cfg.literal_boost)) * (
+                tf * (cfg.k1 + 1.0) / (tf + norm[hit])
+            )
+            # `touched` holds each doc once, so plain fancy-index += is exact.
+            self._acc[docs[hit]] += contrib.astype(np.float32)
 
 
 def bm25_scores(index: GraphIndex, query: str, k1: float = 1.2, b: float = 0.75):

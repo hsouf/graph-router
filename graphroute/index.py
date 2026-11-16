@@ -112,6 +112,10 @@ class GraphIndex:
         self.terms = terms
         self.term_id = {t: i for i, t in enumerate(terms)}
         self.postings = postings          # n_docs x n_terms, CSC (term-major)
+        # The router binary-searches posting slices, so doc ids within each
+        # term must be ascending. A no-op for anything `tocsc()` produced; one
+        # O(nnz) check for a matrix rebuilt from arrays on load.
+        self.postings.sort_indices()
         self.doc_len = doc_len
         self.df = df
         self.anchor_of = anchor_of        # term id -> anchor id, or -1
